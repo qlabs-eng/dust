@@ -42,8 +42,8 @@ Only `dust.py` was modified in place (the estimate/apply split); everything else
       perturbation deep in the network re-runs fewer layers than one near the input. This is what makes
       variants A/B/C/D comparable before we spend any GPU time, and it sizes memory. (2) *Measured:*
       times real steps correctly (CUDA events, warmup discarded, median/p10/p90) and flags when a step
-      is limited by CPU launch overhead, not GPU math. (Roofline — FLOPs vs bytes moved — is planned
-      here but not built yet; see Performance extensions.)
+      is limited by CPU launch overhead, not GPU math. (The roofline — FLOPs vs bytes moved — lives
+      in `roofline.py`; see Performance extensions.)
 - [x] **`new_implementation/profiling.py` — the torch.profiler harness.** Produces the per-op and
       per-phase breakdown and a timeline trace, plus a quick "double the batch and see if the time
       doubles" test that says whether we're GPU-bound or launch-bound before trusting any savings number.
@@ -138,11 +138,22 @@ separate out each group's individual effect afterward — the same information f
 All lectures are now read in full. The measurement stack above is built and matches the course method;
 these are the refinements the lectures call for, grouped by file.
 
-- [ ] **accounting — roofline + regimes.** Add bytes-moved (dtype-aware) → arithmetic intensity → an
-      **A100** roofline + MFU, so we can prove the step is left-of-ridge (memory/launch-bound, not
-      compute-bound). Report three regimes (launch-bound / bandwidth-bound / compute-bound), an Amdahl
-      bound on the achievable speedup from the measured GPU-compute fraction, and a step-time split
-      (kernel compute / HBM / launch / other).
+- [x] **roofline + regimes — `new_implementation/roofline.py`.** Per-op FLOPs, dtype-aware bytes,
+      kernel launches and host syncs for every phase of one update (the same phase names as the
+      profiler labels), placed on an **A100** (or H100) roofline: compute / bandwidth / launch floors,
+      the regime per phase, best-case MFU, plus `mfu()` and `amdahl()` for measured numbers. Models
+      both SDPA kernels the explicit mask allows (`efficient`, `math`) and suffix vs full replay.
+      `python new_implementation/roofline.py --population 256`. Checked on CPU
+      (`test_roofline.py`): its matmul FLOPs match a real `DUST.estimate` under `FlopCounterMode`
+      exactly, in both suffix and full-replay modes.
+      **Prediction worth testing:** at K=256 the update is *bandwidth*-bound, not launch-bound —
+      3.4 s GPU floor vs a 0.34 s launch floor, 67% of GPU time in unfused elementwise ops (rotary,
+      relu², the fp32 logit cap every draw, norms, residual ops); weights are <1% of bytes, so they
+      are not "re-streamed like decode". With the `math` attention kernel it is 8.2 s, dominated by
+      the materialised [T, T] scores.
+- [ ] **(GPU) roofline calibration.** Check which SDPA kernel runs; calibrate the per-launch latency
+      from a trace; compare predicted vs measured per-phase time; split measured step time into kernel
+      compute / HBM / launch / other and feed the measured fractions to `amdahl()`.
 - [ ] **profiling — actually see the launch overhead.** Read the trace *gaps*, not just the per-op
       table (GPU-idle gap per step, mean-kernel-vs-gap "thin comb" test); add an nsys timeline with NVTX
       region labels; add a graph-break / compiled-region counter for the compiled path; run Nsight
