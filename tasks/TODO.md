@@ -54,6 +54,30 @@ Only `dust.py` was modified in place (the estimate/apply split); everything else
       method, warmup, reporting percentiles, a stability guard in the curve fit, the precision the
       reference gradient is computed at, and a caveat that FLOP savings may not show up in wall-clock.
 
+## Tests for the measurement stack (CPU) — in progress
+
+The modules above were written without tests. Each test checks against an independent truth, and a
+deliberately broken version of the code must fail it. Run: `python -m pytest new_implementation/`.
+
+- [x] **`test_checkpoint.py`** — a run saved after 2 steps, rebuilt from different seeds, loaded and
+      continued is bit-for-bit the 4-step run that never stopped (weights, momentum, noise generator);
+      resuming without the generator or the momentum must diverge. Also: bf16 embeddings and the
+      per-group learning rates round-trip, no `.tmp` is left behind, per-rank files, world mismatch.
+- [x] **`test_gradient_check.py`** — `compare` on known answers; the backprop reference against a
+      finite difference along each parameter's gradient (must also reject a half-size gradient);
+      seeded, weight-preserving estimates; `fit_cosine_law` recovers a known law; on a tiny model the
+      estimate's cosine to backprop rises with population (head 0.07 → 0.18 at 8× draws), and its
+      scale matches the centering factor (head projection 0.506 vs the predicted 1/2).
+      Fixed two bugs it found in `gradient_check.py`: one seed gave a NaN variance (now raises), and a
+      fit with no positive ceiling returned a complex `c_max` (now NaN with a note).
+- [ ] `test_groups.py`, `test_accounting.py` (FLOPs vs `FlopCounterMode`, as `test_roofline.py`
+      does), `test_profiling.py` (runs end to end on a tiny model).
+- [ ] **CI** — run `pytest new_implementation/` on CPU on every push (GitHub Actions). Team decision.
+- Note: the estimate's expected size is (1 − 1/n) of the gradient (centering includes the draw
+  itself; n = nrep for direct sites, the batch for the head), and smaller still for σ-smoothed and
+  attention-internal groups (measured 0.25–0.44 on the tiny model). Read `rel_norm` with that in mind.
+- Note: `checkpoint.py` works but `dust.py` never calls it, so runs cannot resume yet.
+
 ## Validation — todo (deferred until we have a GPU)
 
 - [ ] **(GPU)** Confirm the new two-half step gives identical numbers to the old fused step under a
