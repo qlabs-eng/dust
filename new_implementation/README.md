@@ -47,6 +47,9 @@ Two consequences drive everything in this folder:
 - **`groups.py`** — the **shared vocabulary**: which parameters belong to which perturbation "group",
   which later layers a perturbation reaches, and how many draws each group gets. One source of truth
   so the three tools above never disagree. No torch dependency.
+- **`test_*.py`** — CPU tests (pytest): `python -m pytest new_implementation/` from the repo root.
+  Each checks against an independent truth (an uninterrupted run, finite differences, a known
+  curve) on a tiny model, so they need no GPU and run in seconds.
 
 ## What changed in the original code
 

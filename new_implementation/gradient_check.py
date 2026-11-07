@@ -158,7 +158,9 @@ def estimate_statistics(estimator, x, y, seeds, reference=None, sync=False):
     cosine to the reference. The cosine spread is exactly the split-quality signal adaptive
     allocation keys on: a noisy group has low, high-variance cosine and should get more draws.
     """
-    samples = [estimate_gradients(estimator, x, y, seed=s, sync=sync)[0] for s in seeds]
+    if len(seeds) < 2:
+        raise ValueError('estimate_statistics needs at least 2 seeds; the variance of one sample is undefined')
+    samples =[estimate_gradients(estimator, x, y, seed=s, sync=sync)[0] for s in seeds]
     names = list(samples[0])
     mean = {n: torch.stack([s[n] for s in samples]).mean(0) for n in names}
     variance = {n: torch.stack([s[n] for s in samples]).var(0, unbiased=True) for n in names}
@@ -204,6 +206,9 @@ def fit_cosine_law(populations, cosines):
     design = torch.stack([torch.ones_like(K), 1.0 / K], dim=1)
     coefficients = torch.linalg.lstsq(design, (1.0 / cos.square()).unsqueeze(1)).solution.squeeze(1)
     a, b = coefficients[0].item(), coefficients[1].item()
+    if a <= 0:  # 1/c_max^2 must be positive; a ** -0.5 would silently return a complex number
+        return dict(c_max=float('nan'), c=float('nan'), rmse=float('nan'),
+                    note=f'fit has no positive ceiling (1/c_max^2 = {a:.3g}); the points do not follow the law')
     c_max, c = a ** -0.5, b / a
     predicted = c_max / torch.sqrt(1.0 + c / K)
     result = dict(c_max=c_max, c=c, rmse=torch.sqrt((predicted - cos).square().mean()).item())
