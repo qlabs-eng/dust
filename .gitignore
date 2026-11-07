@@ -3,3 +3,7 @@ data/
 runs/
 .venv/
 tokenizer/retrained.json
+
+# heavy / scratch material — kept local, not committed
+lectures/
+misc/
