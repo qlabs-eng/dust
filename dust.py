@@ -5,6 +5,8 @@ No autograd or backward pass is used. One update (DUST.step):
   2. Direct draws jitter a layer's output at every token, y + sigma * a with a ~ N(0, I), rerun the
      forward and reward each token's jitter with the loss reduction at that token. The
      reward-weighted noise, averaged over draws, is the estimated error at the layer's output.
+     A draw at block l reruns only blocks l onward, from the residual stream the clean pass
+     cached at block l (cached-suffix execution; --full-replay reruns the whole network instead).
   3. The attention internals (queries, keys, values, value-embedding gates, value embeddings) are
      credited through the estimated error at the attention output instead,
      recomputing only their block's attention.
@@ -109,10 +111,14 @@ class DUST:
     Forward hooks on every Linear and Embedding capture its input and output during the clean pass and add the
     current jitter to its output during a draw. Pre-hooks on attn.c_proj add the virtual sites o@{layer}, the
     attention output before the projection. Each GPU draws different noise for the same batch.
+
+    With suffix=True (baseline A) a direct draw at block l restarts the forward at block l from the
+    clean pass's cached residual stream; suffix=False reruns the whole network (the public code).
+    Both consume the same noise, so for a fixed seed they differ only by floating-point rounding.
     """
 
-    def __init__(self, model, settings, seed=42, rank=0, world=1):
-        self.model, self.settings, self.world = model, settings, world
+    def __init__(self, model, settings, seed=42, rank=0, world=1, suffix=True):
+        self.model, self.settings, self.world, self.suffix = model, settings, world, suffix
         self.device = next(model.parameters()).device
         self.dtype = torch.bfloat16 if self.device.type == 'cuda' else torch.float32
         self.generator = torch.Generator(self.device).manual_seed(seed + 3 + 7777 * rank)
@@ -160,23 +166,36 @@ class DUST:
     def noise(self, *shape, dtype=None):
         return torch.randn(*shape, device=self.device, dtype=dtype or self.dtype, generator=self.generator)
 
-    def losses(self, x, y):
+    def losses(self, x, y, resume=None, streams=None):
+        """Per-token losses. resume = (start, stream, x0) reruns only blocks start onward."""
         with self.autocast():
-            return self.model(x, y, loss_reduction='none').view_as(y).float()
+            if resume is None:
+                loss = self.model(x, y, loss_reduction='none', streams=streams)
+            else:
+                loss = self.model.forward_from(*resume, x, y, loss_reduction='none')
+            return loss.view_as(y).float()
 
     def capture(self, x, y):
         self.x, self.y = x, y
         self.batch, self.length = x.shape
+        self.streams = []  # streams[l]: the clean residual stream entering block l; streams[0] is x0
         self.capturing = True
         try:
-            self.clean_loss = self.losses(x, y)
+            self.clean_loss = self.losses(x, y, streams=self.streams)
         finally:
             self.capturing = False
 
-    def direct_errors(self, sites, draws, sigma):
-        """One-sided loss drops, centered across each chunk of draws. """
+    def direct_errors(self, sites, draws, sigma, start=None):
+        """One-sided loss drops, centered across each chunk of draws.
+
+        start is the first block the sites can change; with cached-suffix execution each draw reruns
+        only blocks start onward. None (the token embedding) always reruns the whole network.
+        """
         n = self.settings.nrep
         x, y = self.x.repeat(n, 1), self.y.repeat(n, 1)
+        resume = None
+        if self.suffix and start is not None:
+            resume = start, self.streams[start].repeat(n, 1, 1), self.streams[0].repeat(n, 1, 1)
         width = lambda s: self.model.config.n_embd if s.startswith('o@') else self.outputs[s].shape[-1]
         errors = {s: torch.zeros(self.batch, self.length, width(s), device=self.device) for s in sites}
 
@@ -184,7 +203,7 @@ class DUST:
             noise = {s: self.noise(n * self.batch, self.length, width(s)) for s in sites}
             self.jitter = {s: sigma * a for s, a in noise.items()}
             try:
-                perturbed_loss = self.losses(x, y).view(n, self.batch, self.length)
+                perturbed_loss = self.losses(x, y, resume).view(n, self.batch, self.length)
             finally:
                 self.jitter = {}
 
@@ -376,7 +395,7 @@ class DUST:
                     ([prefix + 'mlp.c_fc'], r.hidden[layer]),
                 ]
                 for sites, count in groups:
-                    for site, error in self.direct_errors(sites, count // world, 0.2).items():
+                    for site, error in self.direct_errors(sites, count // world, 0.2, layer).items():
                         gradients[site + '.weight'] = self.reassemble(site, error)
 
         with record_function('dust/embedding'):
@@ -392,7 +411,8 @@ class DUST:
             for layer in range(self.model.config.n_layer):
                 site = f'o@{layer}'
                 sigma = 0.2 if layer < self.model.config.n_layer // 2 else 0.4
-                targets[layer] = average_ranks(self.direct_errors([site], r.hubs[layer] // world, sigma)[site])
+                errors = self.direct_errors([site], r.hubs[layer] // world, sigma, layer)
+                targets[layer] = average_ranks(errors[site])
 
         with record_function('dust/head'):
             gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
@@ -517,6 +537,10 @@ def main():
         '--steps', type=int,
         help='Stop early for a smoke test; the training subset stays unchanged.',
     )
+    parser.add_argument(
+        '--full-replay', action='store_true',
+        help='Rerun the whole network for every direct draw, as the public code does (upstream reference).',
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -555,7 +579,7 @@ def main():
     # Every rank sees the same batch; only the perturbation population is divided across ranks.
     model = make_model(config, device, args.seed)
     optimizer = make_optimizer(model, settings)
-    estimator = DUST(model, settings, args.seed, rank, world)
+    estimator = DUST(model, settings, args.seed, rank, world, suffix=not args.full_replay)
     if args.output.exists() and any(args.output.iterdir()):
         raise FileExistsError(f'Choose an empty output directory: {args.output}')
     if rank == 0:
@@ -575,6 +599,7 @@ def main():
         model=asdict(config),
         recipe=asdict(settings),
         reward_centering='per-token local draw-chunk mean; skipped at nrep=1; no rescaling',
+        execution='full-replay' if args.full_replay else 'cached-suffix',
         parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],
                                parameters=sum(p.numel() for p in g['params']))
                           for g in optimizer.param_groups],
