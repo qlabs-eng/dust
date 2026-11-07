@@ -25,6 +25,7 @@ import time
 
 import torch
 from torch import nn
+from torch.profiler import record_function
 
 from model import GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
 
@@ -351,42 +352,63 @@ class DUST:
         return dict(zip(('resid_lambdas', 'x0_lambdas'), estimate))
 
     @torch.no_grad()
-    def step(self, x, y, optimizer):
-        """One clean pass, direct-loss estimates, local attention estimates, then an SGD update."""
-        self.capture(x, y)
+    def estimate(self, x, y):
+        """One clean pass plus the forward-only gradient estimate, without touching the weights.
+
+        Returns (gradients, valid_tokens, clean_loss). ``gradients`` maps each parameter name to
+        its estimate summed over tokens; dividing by ``valid_tokens`` gives the gradient of the
+        mean loss, the same normalization the backprop baseline uses. Diagnostics and the adaptive
+        allocator call this and inspect the estimate; apply() consumes it to take the SGD step.
+        estimate() followed by apply() is identical to the old fused step().
+        """
+        # record_function labels name each phase in the profiler table and the Perfetto trace, so the
+        # trace reads as direct / embedding / hubs / head / local / scalars (Lecture 3). They are inert
+        # when no profiler is active, so they stay in the hot path.
+        with record_function('dust/clean'):
+            self.capture(x, y)
         r, world = self.settings, self.world
         gradients = {}
-        for layer in range(self.model.config.n_layer):
-            prefix = f'transformer.h.{layer}.'
-            groups = [
-                ([prefix + 'attn.c_proj', prefix + 'mlp.c_proj'], r.writers[layer]),
-                ([prefix + 'mlp.c_fc'], r.hidden[layer]),
-            ]
-            for sites, count in groups:
-                for site, error in self.direct_errors(sites, count // world, 0.2).items():
-                    gradients[site + '.weight'] = self.reassemble(site, error)
+        with record_function('dust/direct'):
+            for layer in range(self.model.config.n_layer):
+                prefix = f'transformer.h.{layer}.'
+                groups = [
+                    ([prefix + 'attn.c_proj', prefix + 'mlp.c_proj'], r.writers[layer]),
+                    ([prefix + 'mlp.c_fc'], r.hidden[layer]),
+                ]
+                for sites, count in groups:
+                    for site, error in self.direct_errors(sites, count // world, 0.2).items():
+                        gradients[site + '.weight'] = self.reassemble(site, error)
 
-        site = 'transformer.wte'
-        error = self.direct_errors([site], r.embedding // world, 0.2)[site]
-        gradients[site + '.weight'] = self.reassemble(site, error)
+        with record_function('dust/embedding'):
+            site = 'transformer.wte'
+            error = self.direct_errors([site], r.embedding // world, 0.2)[site]
+            gradients[site + '.weight'] = self.reassemble(site, error)
 
         # Attention outputs, each block alone. The deeper half moves the loss too little at 0.2 for a readable
         # reward, so it uses 0.4. The targets are averaged over GPUs so that every GPU scores the attention
         # internals against the estimate from the whole population.
-        targets = {}
-        for layer in range(self.model.config.n_layer):
-            site = f'o@{layer}'
-            sigma = 0.2 if layer < self.model.config.n_layer // 2 else 0.4
-            targets[layer] = average_ranks(self.direct_errors([site], r.hubs[layer] // world, sigma)[site])
+        with record_function('dust/hubs'):
+            targets = {}
+            for layer in range(self.model.config.n_layer):
+                site = f'o@{layer}'
+                sigma = 0.2 if layer < self.model.config.n_layer // 2 else 0.4
+                targets[layer] = average_ranks(self.direct_errors([site], r.hubs[layer] // world, sigma)[site])
 
-        gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
-        for kind, count in r.local.items():
-            for site, error in self.local_errors(kind, count // world, targets).items():
-                gradients[site + '.weight'] = self.reassemble(site, error)
-        gradients.update(self.scalar_gradients(8 // world))
+        with record_function('dust/head'):
+            gradients['lm_head.weight'] = self.reassemble('lm_head', self.head_error(r.head // world))
+        with record_function('dust/local'):
+            for kind, count in r.local.items():
+                for site, error in self.local_errors(kind, count // world, targets).items():
+                    gradients[site + '.weight'] = self.reassemble(site, error)
+        with record_function('dust/scalars'):
+            gradients.update(self.scalar_gradients(8 // world))
 
-        # Dividing the summed estimates by the token count gives the gradient of the mean loss.
         valid_tokens = (y != -1).sum()
+        return gradients, valid_tokens, self.clean_loss[y != -1].mean().item()
+
+    @torch.no_grad()
+    def apply(self, gradients, valid_tokens, optimizer):
+        """Normalize the summed estimate to the mean-loss gradient, sync across ranks, take one SGD step."""
         optimizer.zero_grad(set_to_none=True)
         for name, parameter in self.model.named_parameters():
             gradient = average_ranks((gradients[name] / valid_tokens).to(parameter.dtype))
@@ -394,7 +416,13 @@ class DUST:
                 raise FloatingPointError(f'Non-finite estimate for {name}')
             parameter.grad = gradient
         optimizer.step()
-        return self.clean_loss[y != -1].mean().item()
+
+    @torch.no_grad()
+    def step(self, x, y, optimizer):
+        """One clean pass, forward-only estimate, then an SGD update (estimate followed by apply)."""
+        gradients, valid_tokens, loss = self.estimate(x, y)
+        self.apply(gradients, valid_tokens, optimizer)
+        return loss
 
 
 def load_sequences(path, count, sequence_len=2048):
