@@ -9,3 +9,6 @@ lectures/
 misc/
 # copyrighted paper PDFs — bibliographies are committed, the PDFs stay local
 literature/**/*.pdf
+
+# local Claude Code context, not shared
+CLAUDE.md
