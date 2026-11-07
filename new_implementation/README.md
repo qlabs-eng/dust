@@ -51,6 +51,12 @@ Two consequences drive everything in this folder:
   `estimate()` is tagged with `record_function('dust/<phase>')` so a profiler trace reads in DUST
   terms (clean / direct / embedding / hubs / head / local / scalars). This split is what lets
   `gradient_check.py` run the estimate without ever touching the weights.
+- **Cached-suffix execution (Track 1, baseline A).** `../model.py` gains `GPT.forward_from(start, x,
+  x0, idx, ...)` (the full `forward` is `forward_from(0, ...)` and can record the residual stream
+  entering each block). `../dust.py` caches those streams in the clean pass, and a direct draw at block
+  l reruns only blocks l onward; the token embedding still reruns everything. `--full-replay` restores
+  the public code's whole-network replay for the upstream reference. `test_suffix.py` is the CPU
+  equivalence gate (`python -m pytest new_implementation/test_suffix.py`).
 - Nothing else in the original repo was modified.
 
 ## How it wires together

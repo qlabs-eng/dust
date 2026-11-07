@@ -69,12 +69,21 @@ A perturbation injected at some layer can only change the layers after it. Re-ru
 to score it is wasted work. This track caches everything up to the injection point and re-runs just the
 tail.
 
-- [ ] **`model.py`** — add a way to run the model starting from a chosen layer using cached inputs, and
-      rebuild the normal forward pass on top of it.
-- [ ] **`dust.py`** — during the clean pass, cache each block's input; then score the direct draws by
-      re-running only the layers after the injection point instead of the full network.
-- [ ] **Gate:** prove it matches the full re-run exactly, then measure the saving (expect roughly
-      15–20% fewer FLOPs; wall-clock may not move if we turn out to be launch-bound — see lessons L3.1).
+- [x] **`model.py`** — add a way to run the model starting from a chosen layer using cached inputs, and
+      rebuild the normal forward pass on top of it. (`GPT.forward_from`; `forward` is now
+      `forward_from(0, ...)`, and can record the stream entering each block.)
+- [x] **`dust.py`** — during the clean pass, cache each block's input; then score the direct draws by
+      re-running only the layers after the injection point instead of the full network. On by default;
+      `--full-replay` (`DUST(..., suffix=False)`) keeps the public code's behaviour as the upstream
+      reference, with the same noise stream. Saved in `config.json` as `execution`.
+- [x] **Gate, CPU half:** `new_implementation/test_suffix.py` — on a tiny fp32 model, suffix and full
+      replay give identical gradient estimates under a matched seed (max relative difference 0.0), and
+      block-execution counts prove draws at block l skip blocks before l. A deliberate off-by-one start
+      block fails the check. Predicted saving from `accounting.analytic_cost`: 15.5–17.9% of update
+      FLOPs across the shipped recipes (16.4% at 1M/16k).
+- [ ] **(GPU) Gate, GPU half:** rerun the equivalence under bf16 autocast (expect small, not zero,
+      differences: the replayed prefix runs at batch n·B vs B), then measure runtime and peak memory vs
+      `--full-replay` (wall-clock may not move if we turn out to be launch-bound — see lessons L3.1).
 - Note: this is the **only** paper optimization still missing from the public code — the other two
   shortcuts are already in it. It's also the groundwork that multiplexing (Track 3) builds on.
 

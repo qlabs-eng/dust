@@ -181,12 +181,24 @@ class GPT(nn.Module):
         sizes[-1] = (long_w, 0)
         return sizes
 
-    def forward(self, idx, targets=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, loss_reduction='mean', streams=None):
+        x0 = norm(self.transformer.wte(idx))
+        return self.forward_from(0, x0, x0, idx, targets, loss_reduction, streams)
+
+    def forward_from(self, start, x, x0, idx, targets=None, loss_reduction='mean', streams=None):
+        """Run blocks start onward, then the head, from the residual stream x entering block start.
+
+        x is the stream before block start's residual mix (the previous block's output, or x0 for
+        block 0), so forward_from(0, x0, x0, idx) is the full forward. If streams is a list, the stream
+        entering each block run is appended to it; after a full forward streams[i] enters block i and
+        streams[0] is x0, which is what DUST caches to rerun only the blocks a perturbation reaches.
+        """
         B, T = idx.size()
         cos_sin = (self.cos[:, :T], self.sin[:, :T])
-        x = norm(self.transformer.wte(idx))
-        x0 = x
-        for i, block in enumerate(self.transformer.h):
+        for i in range(start, self.config.n_layer):
+            block = self.transformer.h[i]
+            if streams is not None:
+                streams.append(x)
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
             x = block(x, ve, cos_sin, self.window_sizes[i])
