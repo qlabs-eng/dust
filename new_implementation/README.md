@@ -32,7 +32,12 @@ Two consequences drive everything in this folder:
   reports it in "forward-pass equivalents" (how many clean forward passes' worth of work one update
   costs), so variants A/B/C/D are comparable on paper before any GPU time, and memory can be sized.
   *Measured:* times real steps the right way (CUDA events, warmup discarded, median/p10/p90) and flags
-  launch-bound steps. (Roofline — pairing FLOPs with bytes moved — is planned here, not yet built.)
+  launch-bound steps.
+- **`roofline.py`** — the **roofline**: accounting's FLOPs paired with bytes moved, kernel launches and
+  host syncs, per op and per phase, placed on an A100/H100 roofline to name each phase's regime
+  (compute / bandwidth / launch) and the best-case MFU; plus `mfu()` and `amdahl()` for measured
+  numbers. `python roofline.py --population 256 [--attention math] [--full-replay] [--json]`.
+  `test_roofline.py` pins its matmul FLOPs to a real `DUST.estimate` under `FlopCounterMode`.
 - **`profiling.py`** — the **torch.profiler harness**: the per-op / per-phase table and a Perfetto
   trace, plus a double-batch test that says whether the step is GPU-bound or launch-bound before we
   trust any savings number.
