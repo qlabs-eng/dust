@@ -115,7 +115,9 @@ def group_vectors(gradients):
 
 
 def _cosine(a, b):
-    return torch.nn.functional.cosine_similarity(a, b, dim=0, eps=1e-20).item()
+    # float64: fp32 accumulation over a multi-million-entry group (the embedding) drifts by ~1e-4,
+    # enough to report a cosine above 1 and to blur the high-cosine end of the cosine-law fit.
+    return torch.nn.functional.cosine_similarity(a.double(), b.double(), dim=0, eps=1e-20).item()
 
 
 def compare(reference, estimate, per_parameter=False):

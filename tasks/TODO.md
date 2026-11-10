@@ -70,8 +70,25 @@ deliberately broken version of the code must fail it. Run: `python -m pytest new
       scale matches the centering factor (head projection 0.506 vs the predicted 1/2).
       Fixed two bugs it found in `gradient_check.py`: one seed gave a NaN variance (now raises), and a
       fit with no positive ceiling returned a complex `c_max` (now NaN with a note).
-- [ ] `test_groups.py`, `test_accounting.py` (FLOPs vs `FlopCounterMode`, as `test_roofline.py`
-      does), `test_profiling.py` (runs end to end on a tiny model).
+- [x] **`test_groups.py`** — every parameter of a real GPT (tiny, base, odd depth) maps to a group; the
+      value-embedding blocks match `model.has_ve`; population K = writers + hidden + hubs + embedding for
+      every shipped recipe; whole-model attention-internal counts equal the draws `local_errors` samples.
+      Fixed a bug it found: `group_draw_count`/`total_draws` returned *one block's* q/k/v/gate/ve count as
+      the whole-model total (they are per block); now `count × blocks` (needs `n_layer`), plus a
+      `population()` helper. `accounting` was unaffected (it already looped over blocks).
+- [x] **`test_accounting.py`** — `analytic_cost`'s forward FLOPs (clean + direct + embedding + scalars)
+      equal what PyTorch executed in a real `DUST.estimate` under `FlopCounterMode`, attention included
+      (the CPU SDPA is swapped for an identical explicit-matmul attention), in suffix and full-replay
+      modes; a wrong-suffix prediction fails. Also: window sizes and parameter bytes vs the model, the
+      suffix saving, world split, memory scaling, nearest-rank percentiles, `RunMeters`, `measure`.
+      **Open convention question:** on sliding-window blocks accounting counts only in-window keys, but
+      `model.attention` passes a mask to SDPA, so the dense scores are computed — accounting is ~2–2.5%
+      below executed FLOPs at SSSL (pinned by a test). Decide whether "FLOPs" means needed or executed.
+- [x] **`test_profiling.py`** — `profile_estimate` labels every `dust/<phase>` in the table and the trace;
+      `profile_training` stops after its schedule; `launch_bound_test` gives the right verdict for steps
+      of known cost (constant → launch-bound, proportional → GPU-bound).
+- [x] `gradient_check._cosine` now computes in float64: fp32 over the embedding group gave cos(g, g) =
+      1.00016 and failed `test_compare_on_known_answers` on this machine.
 - [ ] **CI** — run `pytest new_implementation/` on CPU on every push (GitHub Actions). Team decision.
 - Note: the estimate's expected size is (1 − 1/n) of the gradient (centering includes the draw
   itself; n = nrep for direct sites, the batch for the head), and smaller still for σ-smoothed and
@@ -191,6 +208,26 @@ these are the refinements the lectures call for, grouped by file.
       `.item()` / branch-on-tensor / arbitrary Python — those break fusion **and** CUDA-Graph capture at
       once. This supersedes the old "scope decision": the course is built on exactly this, so treat it as
       first-class, not out of scope.
+- [ ] **Masked-aware attention (skip masked positions), GPU-validate.** `model.attention` passes an
+      explicit boolean mask to SDPA, which rules out the flash kernel: every block computes all T×T
+      scores, including the causal future and the keys outside the sliding window. On the 8×512 model at
+      2048 tokens that is ~32% more attention-inclusive update FLOPs than needed (1M/K=256 update:
+      executed 3.54e14 vs needed 2.68e14). Likely one of the README's "omitted execution
+      optimizations": `model.py`'s `(left, 0)` window tuples are flash-attn's `window_size` format, so the
+      authors probably ran flash attention with a sliding window (inference, not stated in the paper).
+      Plan: full-window blocks → SDPA `is_causal=True`, no mask (flash kernel, exact); sliding blocks →
+      FlexAttention causal+window block mask (or the `flash-attn` FA2 package, `window_size=(w, 0)`; FA3
+      is H100-only). `local_errors` calls the same function, so it benefits too. Behind a flag
+      (`--attention masked|flash`) so the upstream reference stays reproducible; A/B/C/D all use the
+      fast path. Gate: CPU test that outputs match the masked path within tolerance; GPU check within
+      bf16 tolerance + timing. Report it as an engineering speedup, separately from B/C.
+- [ ] **FLOP convention: log "needed" and "executed".** `accounting.attention_flops` is currently a
+      hybrid — full-window blocks charged all T keys (incl. the causal-masked half), sliding blocks
+      charged window+1 keys (ignoring causality) — 85% of executed on the base model, pinned by
+      `test_accounting.py::test_sliding_windows_are_counted_as_windowed`. Replace with two counts:
+      *needed* (causal + window; primary compute axis) and *executed* (what the kernel runs: dense
+      today, ≈ needed + tile overhead once the masked-aware attention lands). Planned with the
+      training-time metrics wiring.
 
 ## Experiment campaign — todo
 

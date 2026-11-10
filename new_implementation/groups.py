@@ -86,23 +86,51 @@ def suffix_start_block(site, n_layer):
     return layer
 
 
-def group_draw_count(recipe, group, layer=None):
-    """Draws a Recipe assigns to ``group`` (at ``layer`` for per-block groups; the sum if layer is None).
+def has_value_embedding(layer, n_layer):
+    """Value embeddings (and their gates) sit on every other block, counting back from the last
+    (mirrors model.has_ve; duplicated so this module stays torch-free)."""
+    return layer % 2 == (n_layer - 1) % 2
 
+
+def group_layers(group, n_layer):
+    """Blocks a per-block group perturbs: every block, except gate and ve which exist only where a
+    value embedding does."""
+    if group in ('gate', 've'):
+        return [i for i in range(n_layer) if has_value_embedding(i, n_layer)]
+    return list(range(n_layer))
+
+
+def group_draw_count(recipe, group, layer=None, n_layer=None):
+    """Draws a Recipe assigns to ``group``: at ``layer`` for per-block groups, or the whole-model sum.
+
+    The five attention-internal groups store one *per-block* count in ``recipe.local`` that every
+    applicable block runs (DUST.local_errors), so their whole-model sum needs ``n_layer``.
     ``scalars`` is fixed at 8 two-sided draws in DUST.estimate and is not carried in the Recipe.
     """
     if group == 'scalars':
         return 8
     if group in _LOCAL_GROUPS:
-        return recipe.local[group]
+        per_block = recipe.local[group]
+        if layer is not None:
+            return per_block
+        if n_layer is None:
+            raise ValueError(f'the whole-model draw count of {group!r} needs n_layer (it is per block)')
+        return per_block * len(group_layers(group, n_layer))
     value = getattr(recipe, group)
     if group in PER_BLOCK_GROUPS:
         return sum(value) if layer is None else value[layer]
     return value  # embedding, head
 
 
-def total_draws(recipe):
-    """Every group's draws summed. Note this exceeds the nominal population K: K counts only the
-    direct-loss draws (writers + hidden + hubs + embedding), while head, the five attention
-    internals, and the residual scalars are additional. Accounting must use this, not K."""
-    return sum(group_draw_count(recipe, group) for group in DRAW_GROUPS)
+def total_draws(recipe, n_layer=None):
+    """Every group's draws summed over the whole model. Note this exceeds the nominal population K: K
+    counts only the direct-loss draws (writers + hidden + hubs + embedding), while head, the five
+    attention internals, and the residual scalars are additional. Accounting must use this, not K.
+    ``n_layer`` defaults to the length of the recipe's per-block lists."""
+    n_layer = len(recipe.writers) if n_layer is None else n_layer
+    return sum(group_draw_count(recipe, group, n_layer=n_layer) for group in DRAW_GROUPS)
+
+
+def population(recipe):
+    """The nominal population K: direct-loss draws only (writers + hidden + hubs + embedding)."""
+    return sum(group_draw_count(recipe, g) for g in ('writers', 'hidden', 'hubs', 'embedding'))
