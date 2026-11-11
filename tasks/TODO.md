@@ -93,7 +93,26 @@ deliberately broken version of the code must fail it. Run: `python -m pytest new
 - Note: the estimate's expected size is (1 − 1/n) of the gradient (centering includes the draw
   itself; n = nrep for direct sites, the batch for the head), and smaller still for σ-smoothed and
   attention-internal groups (measured 0.25–0.44 on the tiny model). Read `rel_norm` with that in mind.
-- Note: `checkpoint.py` works but `dust.py` never calls it, so runs cannot resume yet.
+- [x] **Training-time metrics wired in — `run_metrics.py`, `dust.train()`, `backprop.train()`.** Both
+      loops write one record per step: cumulative analytic FLOPs / forward-equivalents / draws,
+      `train_seconds` and GPU-hours (eval, probes, checkpoint writes excluded), honest `elapsed_seconds`,
+      step time, peak memory (CUDA), the allocation when it changes; optional gradient-cosine probe vs
+      backprop every N steps (`--probe-interval`, `--probe-seeds` ≥ 2 adds variance/bias). Fixes the old
+      `elapsed_seconds`, which counted evaluation time as training time.
+- [x] **Checkpoint/resume wired into `dust.py`** (`--checkpoint-interval`, `--resume`). Refuses a
+      different model/recipe/seed/world/data; rewinds `metrics.jsonl` to the checkpoint; restores best
+      val + best weights. Fixed `checkpoint.load_state` for CUDA generators (`set_state` needs a CPU
+      tensor) — **unverified on GPU**. Backprop baseline has logging but no resume.
+- [x] **`toy.py` + `--toy` / `--device`** — CPU smoke runs of both trainers (DUST: val 8.32 → ~2.1 in
+      40 steps, ~15 s). **`test_training.py`**: train() = bare `DUST.step` loop; both methods learn; logged
+      cost = steps × analytic cost (draws checked against `groups`); eval excluded from train time; the
+      probe leaves training bit-identical; a crash past the checkpoint + resume = the uninterrupted run;
+      resume refuses a changed seed/recipe; the CLIs run and resume. Resume and probe tests verified to
+      fail when the rewind or the RNG restore is removed.
+- [ ] **(GPU)** check the CUDA paths the CPU tests cannot: CUDA-event timing / peak memory in the records,
+      generator restore on resume, multi-GPU (per-rank `state.pt`, rank-0 metrics), probe memory at batch 8.
+- Not yet: split-half noise signal (first piece of Track 2); same logging is FLOP-convention-dependent
+  (see "FLOP convention" below).
 
 ## Validation — todo (deferred until we have a GPU)
 

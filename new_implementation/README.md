@@ -47,6 +47,15 @@ Two consequences drive everything in this folder:
 - **`groups.py`** — the **shared vocabulary**: which parameters belong to which perturbation "group",
   which later layers a perturbation reaches, and how many draws each group gets. One source of truth
   so the three tools above never disagree. No torch dependency.
+- **`run_metrics.py`** — the **training-time log**: the per-step record `dust.py` and
+  `baselines/backprop.py` write to `metrics.jsonl` — cumulative analytic FLOPs and forward-equivalents
+  (from the live Recipe, so a changing allocation is charged what it ran), cumulative draws, training
+  seconds / GPU-hours with eval, probes and checkpoint writes **excluded**, honest total wall clock,
+  step time and peak memory, and the draw allocation whenever it changes. `gradient_probe` scores the
+  estimate against backprop on a held-out batch without disturbing the perturbation RNG.
+- **`toy.py`** — a **toy setup** (4×64 model, tiny recipe, synthetic data with a learnable next-token
+  rule) so the full training path runs on a CPU in seconds: `python dust.py --toy`,
+  `python baselines/backprop.py --toy`. For checking plumbing, not for results.
 - **`test_*.py`** — CPU tests (pytest): `python -m pytest new_implementation/` from the repo root.
   Each checks against an independent truth (an uninterrupted run, finite differences, a known
   curve) on a tiny model, so they need no GPU and run in seconds.
@@ -65,14 +74,23 @@ Two consequences drive everything in this folder:
   l reruns only blocks l onward; the token embedding still reruns everything. `--full-replay` restores
   the public code's whole-network replay for the upstream reference. `test_suffix.py` is the CPU
   equivalence gate (`python -m pytest new_implementation/test_suffix.py`).
-- Nothing else in the original repo was modified.
+- **Training loop → `train()`, with logging and checkpoint/resume.** `../dust.py`'s loop moved out of
+  `main()` into `train(config, settings, training, validation, testing, output, ...)` — same steps in
+  the same order (`test_training.py` checks it ends at the weights of a bare `DUST.step` loop). It now
+  writes `run_metrics` records, saves `state.pt` every `--checkpoint-interval` steps, continues with
+  `--resume` (refusing a different model/recipe/seed/world/data, and rewinding `metrics.jsonl` to the
+  checkpoint), and probes gradient cosine every `--probe-interval` steps. `--toy` and `--device` allow
+  CPU smoke runs. `elapsed_seconds` used to include evaluation time; `train_seconds` now excludes it.
+- **`../baselines/backprop.py`** — same refactor into `train()` and the same `run_metrics` records (an
+  update charged as 3 forwards), plus `--toy` / `--device`. No checkpoint/resume (not needed yet).
 
 ## How it wires together
 
-`accounting` imports `groups`; `profiling` imports `accounting`; `gradient_check` imports `groups` and
-reaches back to `../dust.py` for one helper (`average_ranks`) through a small `sys.path` shim at the
-top of the file, so it works both run as a script and imported as a module. **No file in the original
-repo imports anything here**, which is why moving this folder out cannot break the training path.
+`accounting` imports `groups`; `profiling` and `run_metrics` import `accounting`; `gradient_check`
+imports `groups` and reaches back to `../dust.py` for one helper (`average_ranks`) through a small
+`sys.path` shim. **`../dust.py` now imports from here** (`checkpoint`, `run_metrics`; `toy` only under
+`--toy`) by appending this folder to `sys.path`, so this folder can no longer be moved out without
+breaking training. `run_metrics` imports `gradient_check` lazily to avoid an import cycle with `dust`.
 
 ## Where the rest lives
 

@@ -69,7 +69,8 @@ def load_state(base, *, model, optimizer, estimator, rank=0, world=1, map_locati
         )
     model.load_state_dict(state['model'])
     optimizer.load_state_dict(state['optimizer'])
-    estimator.generator.set_state(state['generator'].to(estimator.generator.device))
+    # Generator.set_state takes a CPU ByteTensor even for a CUDA generator (its get_state returns one).
+    estimator.generator.set_state(state['generator'].cpu())
     torch.set_rng_state(state['torch_rng'])
     if state['cuda_rng'] is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(state['cuda_rng'])

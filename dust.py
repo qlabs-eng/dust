@@ -18,18 +18,24 @@ No autograd or backward pass is used. One update (DUST.step):
 import argparse
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from functools import partial
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
-import time
+import sys
 
 import torch
 from torch import nn
 from torch.profiler import record_function
 
 from model import GPT, GPTConfig, attention, apply_rotary_emb, has_ve, norm
+
+# Training-time logging and checkpointing live in new_implementation/ (the team's additions).
+sys.path.append(str(Path(__file__).resolve().parent / 'new_implementation'))
+from checkpoint import checkpoint_path, load_state, save_state  # noqa: E402
+from run_metrics import TrainingLog, dust_update_cost, gradient_probe  # noqa: E402
 
 
 @dataclass
@@ -523,6 +529,136 @@ def file_hash(path):
     return digest.hexdigest()
 
 
+def data_hash(*tensors):
+    """SHA-256 of token tensors, so a resumed run can check it sees the same data."""
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(tensor.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def snapshot(model):
+    return {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
+
+
+def train(config, settings, training, validation, testing, output, *, steps, eval_interval, seed=42,
+          device=torch.device('cpu'), rank=0, world=1, suffix=True, batch_size=8, checkpoint_interval=0,
+          resume=False, probe_interval=0, probe_seeds=(0,), metadata=None, echo=print):
+    """Train with DUST and write the run to ``output``; returns result.json's contents (rank 0) or None.
+
+    ``training`` rows are consumed in order, ``batch_size`` per step; every rank sees the same batch and
+    only the perturbation population is split across ranks. Files written (rank 0 unless noted):
+
+    - config.json: ``metadata`` (written once, on a fresh run);
+    - metrics.jsonl: step 0's val loss, then one run_metrics record per step (cost, time, val loss on
+      eval steps, the gradient probe on probe steps);
+    - best.pt: weights at the best validation loss; result.json: best val, test at best val, history,
+      timing summary;
+    - state.pt (every rank, every ``checkpoint_interval`` steps and at the end): resumable full state.
+      ``resume=True`` continues from it, refusing a different model, recipe, seed, world size or data,
+      and rewinds metrics.jsonl to the checkpoint so a crashed tail is not duplicated.
+
+    ``probe_interval`` > 0 scores the estimate against backprop on the first ``batch_size`` validation
+    rows every that many steps (run_metrics.gradient_probe); it does not change the training run.
+    """
+    output = Path(output)
+    state_file, metrics_file = output / 'state.pt', output / 'metrics.jsonl'
+    fingerprint = dict(model=asdict(config), recipe=asdict(settings), seed=seed, world=world,
+                       suffix=suffix, batch_size=batch_size, data_sha256=data_hash(training, validation))
+
+    model = make_model(config, device, seed)
+    optimizer = make_optimizer(model, settings)
+    estimator = DUST(model, settings, seed, rank, world, suffix=suffix)
+    cost = partial(dust_update_cost, config=config, world=world, batch=batch_size, suffix=suffix)
+    run_log = TrainingLog(cost, world=world)
+
+    if resume:
+        if not checkpoint_path(state_file, rank, world).is_file():
+            raise FileNotFoundError(f'Nothing to resume: {checkpoint_path(state_file, rank, world)} does not exist')
+    elif output.exists() and any(output.iterdir()):
+        raise FileExistsError(f'Choose an empty output directory: {output}')
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=True)
+    if world > 1:
+        torch.distributed.barrier()
+
+    def save_best():
+        if rank == 0:
+            torch.save(best_state, output / 'best.pt')
+
+    def write(record):
+        if rank == 0:
+            echo(json.dumps(record))
+            with metrics_file.open('a') as stream:
+                stream.write(json.dumps(record) + '\n')
+
+    if resume:
+        start, _, extra = load_state(state_file, model=model, optimizer=optimizer, estimator=estimator,
+                                     rank=rank, world=world)
+        changed = sorted(k for k in fingerprint if extra['fingerprint'].get(k) != fingerprint[k])
+        if changed:
+            raise ValueError(f'Cannot resume {output}: the run differs from the checkpoint in {changed}')
+        best, best_step, best_state, history = extra['best'], extra['best_step'], extra['best_state'], extra['history']
+        run_log.load_state_dict(extra['log'])
+        if rank == 0:
+            save_best()  # best.pt may hold a better step from after the checkpoint, which is about to rerun
+            kept = [line for line in metrics_file.read_text().splitlines() if json.loads(line)['step'] <= start]
+            metrics_file.write_text(''.join(line + '\n' for line in kept))
+        echo(f'Resuming {output} at step {start} of {steps}, best val {best:.4f}')
+    else:
+        if rank == 0 and metadata is not None:
+            (output / 'config.json').write_text(json.dumps(metadata, indent=2) + '\n')
+        start = best_step = 0
+        with run_log.timed('eval'):
+            best = evaluate(model, validation, device)
+        best_state = snapshot(model) if rank == 0 else None
+        save_best()
+        history = [dict(step=0, val_loss=best)]
+        write(dict(step=0, val_loss=best, flops=0.0, forward_equivalents=0.0, draws=0,
+                   train_seconds=0.0, gpu_hours=0.0))
+
+    if probe_interval:
+        rows = validation[:batch_size].to(device)
+        probe_x, probe_y = rows[:, :-1].contiguous(), rows[:, 1:].contiguous()
+
+    for step in range(start + 1, steps + 1):
+        batch = training[(step - 1) * batch_size:step * batch_size].to(device)
+        with run_log.step():
+            loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
+        record = run_log.record(step, loss, estimator.settings)
+        if step == 1 or step % eval_interval == 0 or step == steps:
+            with run_log.timed('eval'):
+                value = evaluate(model, validation, device)
+            record['val_loss'] = value
+            if value < best:
+                best, best_step = value, step
+                best_state = snapshot(model) if rank == 0 else None
+                save_best()
+        if probe_interval and (step % probe_interval == 0 or step == steps):
+            with run_log.timed('probe'):
+                record['probe'] = gradient_probe(estimator, probe_x, probe_y, probe_seeds, sync=world > 1)
+        history.append(record)
+        write(record)
+        if checkpoint_interval and (step % checkpoint_interval == 0 or step == steps):
+            with run_log.timed('checkpoint'):
+                save_state(
+                    state_file, model=model, optimizer=optimizer, estimator=estimator, step=step,
+                    settings=asdict(settings), rank=rank, world=world,
+                    extra=dict(fingerprint=fingerprint, best=best, best_step=best_step, best_state=best_state,
+                               history=history, log=run_log.state_dict()),
+                )
+
+    estimator.close()
+    if rank != 0:
+        return None
+    model.load_state_dict(torch.load(output / 'best.pt', map_location=device, weights_only=True))
+    result = dict(best_val=best, best_step=best_step, test_at_best_val=evaluate(model, testing, device),
+                  history=history, timing=run_log.summary())
+    (output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+    echo(f"Best validation: {best:.4f} (step {best_step}); test: {result['test_at_best_val']:.4f}")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tokens', choices=DEFAULT_CONFIGS, default='1M')
@@ -541,117 +677,103 @@ def main():
         '--full-replay', action='store_true',
         help='Rerun the whole network for every direct draw, as the public code does (upstream reference).',
     )
+    parser.add_argument(
+        '--toy', action='store_true',
+        help='Tiny model, recipe and synthetic data (new_implementation/toy.py): a CPU smoke run in seconds. '
+             'Ignores --tokens, --population and --data-dir.',
+    )
+    parser.add_argument('--device', help='cuda (default), cpu or mps. Only --toy runs are practical off CUDA.')
+    parser.add_argument('--checkpoint-interval', type=int, default=0,
+                        help='Save resumable state to OUTPUT/state.pt every N steps and at the end (0: never).')
+    parser.add_argument('--resume', action='store_true',
+                        help='Continue the run in --output from its state.pt (same settings and seed).')
+    parser.add_argument('--probe-interval', type=int, default=0,
+                        help='Every N steps, log the cosine of the estimate to backprop on a held-out batch '
+                             '(costs one backprop + one estimate per seed; 0: never).')
+    parser.add_argument('--probe-seeds', type=int, default=1,
+                        help='Estimates per probe; 2 or more also log estimator variance and bias.')
     args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        parser.error('Training requires a CUDA GPU.')
     rank, world = int(os.environ.get('RANK', 0)), int(os.environ.get('WORLD_SIZE', 1))
-    device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
-    torch.cuda.set_device(device)
+    if args.device is None:
+        args.device = 'cuda' if torch.cuda.is_available() or not args.toy else 'cpu'
+    if args.device == 'cuda':
+        if not torch.cuda.is_available():
+            parser.error('Training requires a CUDA GPU (use --toy for a CPU smoke run).')
+        device = torch.device('cuda', int(os.environ.get('LOCAL_RANK', 0)))
+        torch.cuda.set_device(device)
+    else:
+        if world > 1:
+            parser.error('Multi-process runs need CUDA.')
+        device = torch.device(args.device)
     torch.set_float32_matmul_precision('high')
     if world > 1:
         torch.distributed.init_process_group('nccl', device_id=device)
+    if min(args.checkpoint_interval, args.probe_interval) < 0 or args.probe_seeds < 1:
+        parser.error('--checkpoint-interval and --probe-interval must be >= 0, --probe-seeds >= 1')
 
-    settings = recipe(args.tokens, args.population)
-    defaults = DEFAULT_CONFIGS[args.tokens]
-    config = GPTConfig()
-    steps = defaults['steps']
+    if args.toy:
+        from toy import TOY_BATCH, TOY_CONFIG, TOY_EVAL_INTERVAL, TOY_STEPS, toy_data, toy_recipe
+        settings, config, steps, interval = toy_recipe(), TOY_CONFIG, TOY_STEPS, TOY_EVAL_INTERVAL
+        training, validation, testing = toy_data(TOY_STEPS, TOY_BATCH)
+        data = dict(source='toy (new_implementation/toy.py)')
+    else:
+        settings = recipe(args.tokens, args.population)
+        defaults = DEFAULT_CONFIGS[args.tokens]
+        config, steps, interval = GPTConfig(), defaults['steps'], defaults['eval_interval']
+        paths = dict(
+            train=args.data_dir / f'train_{args.tokens}.pt',
+            val=args.data_dir / 'val.pt',
+            test=args.data_dir / 'test.pt',
+        )
+        missing = [str(path) for path in paths.values() if not path.is_file()]
+        if missing:
+            parser.error(
+                f"Missing data: {', '.join(missing)}. Run python prepare_data.py "
+                f"--tokens {args.tokens} --output {args.data_dir}"
+            )
+        training = load_sequences(paths['train'], steps * 8)
+        validation = load_sequences(paths['val'], 544)
+        testing = load_sequences(paths['test'], 544)
+        data = dict(sha256={k: file_hash(v) for k, v in paths.items()}) if rank == 0 else {}
     if args.steps is not None and not 1 <= args.steps <= steps:
         parser.error(f'--steps must be between 1 and {steps}')
-    paths = dict(
-        train=args.data_dir / f'train_{args.tokens}.pt',
-        val=args.data_dir / 'val.pt',
-        test=args.data_dir / 'test.pt',
-    )
-    missing = [str(path) for path in paths.values() if not path.is_file()]
-    if missing:
-        parser.error(
-            f"Missing data: {', '.join(missing)}. Run python prepare_data.py "
-            f"--tokens {args.tokens} --output {args.data_dir}"
-        )
-    training = load_sequences(paths['train'], steps * 8)
-    validation = load_sequences(paths['val'], 544)
-    testing = load_sequences(paths['test'], 544)
     order = torch.randperm(len(training), generator=torch.Generator().manual_seed(args.seed + 1))
     training = training[order]
     steps = args.steps or steps
 
-    # Every rank sees the same batch; only the perturbation population is divided across ranks.
-    model = make_model(config, device, args.seed)
-    optimizer = make_optimizer(model, settings)
-    estimator = DUST(model, settings, args.seed, rank, world, suffix=not args.full_replay)
-    if args.output.exists() and any(args.output.iterdir()):
-        raise FileExistsError(f'Choose an empty output directory: {args.output}')
-    if rank == 0:
-        args.output.mkdir(parents=True, exist_ok=True)
-    if world > 1:
-        torch.distributed.barrier()
-
     metadata = dict(
-        tokens=args.tokens,
-        population=args.population,
+        tokens='toy' if args.toy else args.tokens,
+        population=sum(settings.writers + settings.hidden + settings.hubs) + settings.embedding,
         seed=args.seed,
         world=world,
         steps=steps,
         training_tokens=steps * 8 * config.sequence_len,
-        validation_sequences=544,
-        test_sequences=544,
+        validation_sequences=len(validation),
+        test_sequences=len(testing),
         model=asdict(config),
         recipe=asdict(settings),
         reward_centering='per-token local draw-chunk mean; skipped at nrep=1; no rescaling',
         execution='full-replay' if args.full_replay else 'cached-suffix',
-        parameter_groups=[dict(lr=g['lr'], momentum=g['momentum'],
-                               parameters=sum(p.numel() for p in g['params']))
-                          for g in optimizer.param_groups],
+        device=str(device),
+        checkpoint_interval=args.checkpoint_interval,
+        probe_interval=args.probe_interval,
+        probe_seeds=args.probe_seeds,
         source_sha256=file_hash(Path(__file__)),
         model_sha256=file_hash(Path(__file__).parent / 'model.py'),
         torch_version=torch.__version__,
+        data=data,
     )
     if rank == 0:
-        metadata['data_sha256'] = {k: file_hash(v) for k, v in paths.items()}
-        (args.output / 'config.json').write_text(json.dumps(metadata, indent=2) + '\n')
-
-    best = evaluate(model, validation, device)
-
-    def save_best():
-        if rank == 0:
-            torch.save(
-                {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                args.output / 'best.pt',
-            )
-
-    save_best()
-    history = [dict(step=0, val_loss=best)]
-    interval = defaults['eval_interval']
-    start = time.monotonic()
-    if rank == 0:
-        print(
-            f'{args.tokens}: {steps} steps, population={args.population}, GPUs={world}, val={best:.4f}',
-            flush=True,
-        )
-
-    for step in range(1, steps + 1):
-        batch = training[(step - 1) * 8:step * 8].to(device)
-        loss = estimator.step(batch[:, :-1].contiguous(), batch[:, 1:].contiguous(), optimizer)
-        record = dict(step=step, train_loss=loss, elapsed_seconds=time.monotonic() - start)
-        if step == 1 or step % interval == 0 or step == steps:
-            value = evaluate(model, validation, device)
-            record['val_loss'] = value
-            if value < best:
-                best = value
-                save_best()
-        history.append(record)
-        if rank == 0:
-            print(json.dumps(record), flush=True)
-            with (args.output / 'metrics.jsonl').open('a') as stream:
-                stream.write(json.dumps(record) + '\n')
-
-    estimator.close()
-    if rank == 0:
-        model.load_state_dict(torch.load(args.output / 'best.pt', map_location=device, weights_only=True))
-        result = dict(best_val=best, test_at_best_val=evaluate(model, testing, device), history=history)
-        (args.output / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
-        print(f"Best validation: {best:.4f}; test: {result['test_at_best_val']:.4f}", flush=True)
+        print(f"{metadata['tokens']}: {steps} steps, population={metadata['population']}, GPUs={world}, "
+              f'device={device}', flush=True)
+    train(
+        config, settings, training, validation, testing, args.output,
+        steps=steps, eval_interval=interval, seed=args.seed, device=device, rank=rank, world=world,
+        suffix=not args.full_replay, checkpoint_interval=args.checkpoint_interval, resume=args.resume,
+        probe_interval=args.probe_interval, probe_seeds=tuple(range(args.probe_seeds)), metadata=metadata,
+        echo=lambda line: print(line, flush=True),
+    )
     if world > 1:
         torch.distributed.destroy_process_group()
 
